@@ -36,8 +36,12 @@ class InstallRootImageDdTest(unittest.TestCase):
         self.tmp = Path(tmp.name)
         self.target = self.tmp / "mnt"
         self.target.mkdir()
-        self.image = self.tmp / "omarchy-root.img.zst"
+        self.image = self.tmp / "omarchy-root.sfs"
         self.image.write_bytes(b"\0" * 4096)
+        # The raw image inside it, as _mount_root_image returns it.
+        self.raw = self.tmp / "root-image" / "omarchy-root.img"
+        self.raw.parent.mkdir()
+        self.raw.write_bytes(b"\0" * 4096)
         self.ctx = types.SimpleNamespace(target=self.target, state_dir=self.tmp / "state")
         self.mounts = [
             {"target": str(self.target), "source": f"{DEVICE}[/@]", "fstype": "btrfs",
@@ -73,9 +77,13 @@ class InstallRootImageDdTest(unittest.TestCase):
              mock.patch.object(phases_impl, "_root_image_target_mounts", return_value=(self.mounts, DEVICE)), \
              mock.patch.object(phases_impl, "_umount_tree",
                                side_effect=lambda t: self.calls.append(["umount-tree", str(t)])), \
-             mock.patch.object(phases_impl, "_write_root_image_frames",
+             mock.patch.object(phases_impl, "_mount_root_image",
+                               side_effect=lambda c: self.calls.append(["mount-image", str(c)]) or self.raw), \
+             mock.patch.object(phases_impl, "_umount_root_image",
+                               side_effect=lambda: self.calls.append(["umount-image"])), \
+             mock.patch.object(phases_impl, "_write_root_image_parallel",
                                side_effect=lambda i, d: self.calls.append(["frames", str(i), d]) or frames_written), \
-             mock.patch.object(phases_impl, "_write_root_image_pipe",
+             mock.patch.object(phases_impl, "_write_root_image_dd",
                                side_effect=lambda i, d: self.calls.append(["pipe", str(i), d])), \
              mock.patch.object(phases_impl, "_wait_for_blkid_uuid",
                                side_effect=lambda d: self.calls.append(["blkid-wait", d])), \
@@ -93,11 +101,13 @@ class InstallRootImageDdTest(unittest.TestCase):
 
     def test_order_the_tools_see(self):
         self.install()
-        steps = [["umount-tree"], ["frames"], ["btrfstune", "-f", "-m", DEVICE], ["blkid-wait", DEVICE],
+        steps = [["mount-image"], ["umount-tree"], ["frames"], ["umount-image"],
+                 ["btrfstune", "-f", "-m", DEVICE], ["blkid-wait", DEVICE],
                  ["mount", "-o", "subvolid=5", DEVICE], ["btrfs", "filesystem", "resize", "max"]]
         indices = [self.index(step) for step in steps]
         self.assertEqual(indices, sorted(indices), self.calls)
-        self.assertEqual(self.calls[self.index(["frames"])][1:], [str(self.image), DEVICE])
+        self.assertEqual(self.calls[self.index(["mount-image"])][1:], [str(self.image)])
+        self.assertEqual(self.calls[self.index(["frames"])][1:], [str(self.raw), DEVICE])
 
     def test_layout_left_behind(self):
         self.install()

@@ -1,0 +1,56 @@
+#!/usr/bin/ash
+# Try Omarchy: boot the root image an install would write, from the medium.
+#
+# With omarchy.try=1 on the command line, after archiso has found the medium
+# and mounted its live environment at the new root, put the installed system
+# there instead:
+#
+#   omarchy-root.sfs  the squashfs on the medium holding the root image
+#   omarchy-root.img  the image, attached read-only to a loop device
+#   its btrfs         mounted read-only, subvolume omarchy-root
+#   omarchy-try.sfs   the Try layer (builder/build-try-layer.sh): the user, the
+#                     session, nothing that touches a disk
+#   tmpfs             where everything the session writes goes
+#
+# The backing mounts stay under /run, which switch_root carries into the new
+# root, so the loop device keeps its file for as long as the system runs.
+
+run_latehook() {
+    local base sfs layer upper loop
+    [ "$(getarg omarchy.try)" = "1" ] || return 0
+
+    # shellcheck disable=SC2154
+    # archisobasedir comes from the command line (parse_cmdline in init).
+    base="/run/archiso/bootmnt/${archisobasedir:-arch}/$(uname -m)"
+    sfs="$base/omarchy-root.sfs"
+    layer="$base/omarchy-try.sfs"
+    if [ ! -f "$sfs" ] || [ ! -f "$layer" ]; then
+        err "Try Omarchy: $sfs or $layer is missing; starting the installer instead"
+        return 0
+    fi
+
+    mkdir -p /run/omarchy-try/sfs /run/omarchy-try/image /run/omarchy-try/layer /run/omarchy-try/rw
+    # threads=multi: squashfs decompresses on every core instead of one.
+    if ! mount -t squashfs -o ro,loop,threads=multi "$sfs" /run/omarchy-try/sfs ||
+        ! loop="$(losetup --find --show --read-only -- /run/omarchy-try/sfs/omarchy-root.img)" ||
+        ! mount -t btrfs -o ro,subvol=omarchy-root "$loop" /run/omarchy-try/image ||
+        ! mount -t squashfs -o ro,loop "$layer" /run/omarchy-try/layer; then
+        err "Try Omarchy: could not mount the root image"
+        launch_interactive_shell
+        return 1
+    fi
+
+    # Half of RAM for what the session writes; tmpfs takes pages only as they
+    # are used.
+    upper=/run/omarchy-try/rw
+    mount -t tmpfs -o size=50%,mode=0755 omarchy-try "$upper"
+    mkdir -p "$upper/upper" "$upper/work"
+
+    # archiso's own root: its live environment over a tmpfs. Nothing has run
+    # from it yet.
+    umount /new_root || { err "Try Omarchy: could not unmount the live root"; launch_interactive_shell; return 1; }
+    mount -t overlay omarchy-try \
+        -o "lowerdir=/run/omarchy-try/layer:/run/omarchy-try/image,upperdir=$upper/upper,workdir=$upper/work,index=off,metacopy=off,redirect_dir=off" \
+        /new_root || { err "Try Omarchy: could not mount the session root"; launch_interactive_shell; return 1; }
+    msg ":: Try Omarchy: booting the root image from the medium"
+}

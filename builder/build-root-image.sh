@@ -13,11 +13,14 @@
 # the installer then gives the filesystem a fresh fsid and grows it to fill
 # the partition. The per-machine delta is a small pacstrap after.
 #
-# Usage: build-root-image.sh <pacman.conf> <output.img.zst> <package>...
+# Usage: build-root-image.sh <pacman.conf> <output> <package>...
 #
 #   pacman.conf     Config whose repositories resolve every package; its
 #                   CacheDir must hold the package files so nothing is copied.
-#   output.img.zst  Where to write the packed image.
+#   output          Where to write the image: omarchy-root.sfs, a squashfs
+#                   holding the raw image as omarchy-root.img, which the
+#                   installer writes and Try Omarchy boots; or an .img.zst,
+#                   packed as zstd frames (omarchy-image-write pack).
 #   package...      Packages to pacstrap into the image.
 #
 # Environment:
@@ -26,6 +29,8 @@
 #                               delta against what the image already holds.
 #   OMARCHY_IMAGE_SIZE          Sparse backing file size (default 24G). Only the
 #                               written extents cost anything.
+#   OMARCHY_TRY_LAYER           Where to write the Try layer for this image
+#                               (builder/build-try-layer.sh); none when unset.
 #
 # Needs a privileged environment: loop devices and a btrfs mount.
 
@@ -50,7 +55,7 @@ shift 2 || true
 packages=("$@")
 
 if [[ -z $pacman_conf || -z $output || ${#packages[@]} -eq 0 ]]; then
-  echo "Usage: build-root-image.sh <pacman.conf> <output.img.zst> <package>..." >&2
+  echo "Usage: build-root-image.sh <pacman.conf> <output.sfs|output.img.zst> <package>..." >&2
   exit 1
 fi
 if [[ ! -r $pacman_conf ]]; then
@@ -409,6 +414,12 @@ CONF
   rm -f "$root/etc/mkinitcpio-prebuilt-uki.conf" "$root/etc/kernel/cmdline.prebuilt-uki"
 fi
 
+# The Try layer is built against the finished image, before the shrink: it
+# only reads the image, through an overlay whose upper directory it keeps.
+if [[ -n ${OMARCHY_TRY_LAYER:-} ]]; then
+  bash /builder/build-try-layer.sh "$root" "$OMARCHY_TRY_LAYER"
+fi
+
 # The image is the loop backing file itself: the same on-disk bytes, written
 # to the target partition as they are.
 #
@@ -450,6 +461,23 @@ truncate -s "${shrink_mb}M" "$backing"
 # omarchy-image-write decode and write it on every core at install time:
 # 0.9 s instead of 2.5 s through zstdcat | dd on a 990 PRO. Framing costs
 # 1.3% (55 MB). It is still one valid .zst; zstd -d reads it unchanged.
-echo "Packing the root image as 256 KiB zstd frames"
-omarchy-image-write pack "$backing" "$output"
+if [[ $output == *.sfs ]]; then
+  # A squashfs holding the raw image, so the kernel can mount it: Try Omarchy
+  # boots it from the medium, read as it is used, and the installer copies it
+  # out with omarchy-image-write write-raw. Measured on the 2026-10-25 image
+  # (6.63 GB raw): 3,944,173,568 bytes, 20 MB under the zstd frames below, in
+  # 2 s; reading it all back out mounted threads=multi took 1.28-1.32 s with
+  # the container cached, as the frames' decode does, and 128 KiB random
+  # reads 1.1 ms p50 (EROFS zstd: the same full read, 1.6 ms random; EROFS
+  # LZ4HC: 29 s full read). zstd at level 3 in 1 MiB blocks, no xattrs: the
+  # file inside has none.
+  echo "Packing the root image into a squashfs"
+  mkdir -p "$work/sfs"
+  ln "$backing" "$work/sfs/omarchy-root.img"
+  mksquashfs "$work/sfs" "$output" -comp zstd -Xcompression-level 3 -b 1M -noappend -no-xattrs -quiet
+  rm -f "$work/sfs/omarchy-root.img"
+else
+  echo "Packing the root image as 256 KiB zstd frames"
+  omarchy-image-write pack "$backing" "$output"
+fi
 echo "Root image: $(du -h "$output" | cut -f1) at $output (from ${shrink_mb}M apparent input)"

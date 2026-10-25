@@ -35,7 +35,6 @@ TRY_USER=omarchy
 work=$(mktemp -d /tmp/omarchy-try-layer.XXXXXX)
 upper="$work/upper"
 merged="$work/merged"
-mkdir -p "$upper" "$work/work" "$merged"
 
 cleanup() {
   local status=$?
@@ -43,10 +42,18 @@ cleanup() {
   if mountpoint -q "$merged" 2>/dev/null; then
     umount -R "$merged" || { echo "WARNING: $merged is still mounted; leaving $work" >&2; return $status; }
   fi
+  if mountpoint -q "$work" 2>/dev/null; then
+    umount "$work" || { echo "WARNING: $work is still mounted" >&2; return $status; }
+  fi
   rm -rf "$work"
   return $status
 }
 trap cleanup EXIT
+
+# On a tmpfs of its own: overlayfs refuses an upper directory on another
+# overlay, which is what /tmp is inside the build container.
+mount -t tmpfs -o mode=0755 omarchy-try-layer "$work"
+mkdir -p "$upper" "$work/work" "$merged"
 
 # index, metacopy and redirect_dir off: the upper directory then holds plain
 # files and whiteouts only, nothing that refers back to this particular lower

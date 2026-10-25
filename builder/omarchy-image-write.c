@@ -13,15 +13,24 @@
  * O_DIRECT. The seek table sits in a skippable frame, so the file stays an
  * ordinary .zst: `zstd -d` reads it unchanged.
  *
- *   omarchy-image-write pack  RAW IMAGE.zst
- *   omarchy-image-write write IMAGE.zst TARGET [THREADS]
+ *   omarchy-image-write pack      RAW IMAGE.zst
+ *   omarchy-image-write write     IMAGE.zst TARGET [THREADS]
+ *   omarchy-image-write write-raw RAW TARGET [THREADS]
  *
- * write leaves frames that decode to all zeros unwritten, as dd conv=sparse
- * does: the target must not care what those blocks hold (a freshly formatted
- * partition, where btrfs references none of them).
+ * write-raw writes an image that is not compressed by this tool: the file
+ * inside the ISO's omarchy-root.sfs, which the kernel's squashfs decompresses
+ * as it is read. The same workers take it FRAME_SIZE bytes at a time, copy
+ * each chunk out of the mapping (the page faults are where squashfs decodes,
+ * on as many cores as there are workers when it is mounted threads=multi) and
+ * pwrite it with O_DIRECT.
  *
- * Exit status of write: 0 written and synced; 2 the image is not one this
- * tool writes (no valid seek table, or bad arguments), nothing written, so the
+ * write and write-raw leave frames that are all zeros unwritten, as dd
+ * conv=sparse does: the target must not care what those blocks hold (a freshly
+ * formatted partition, where btrfs references none of them).
+ *
+ * Exit status of write and write-raw: 0 written and synced; 2 the image is not
+ * one this tool writes (no valid seek table; for write-raw, a size that is not
+ * a multiple of 4096; or bad arguments), nothing written, so the
  * caller can write it another way; 1 failed: the target could not be used
  * (missing, in use, too small) or the write failed partway.
  */
@@ -75,6 +84,7 @@ static uint8_t *zero_frame;
 static size_t zero_frame_size;
 static atomic_size_t next_frame, bytes_written, zero_frames;
 static atomic_int failed;
+static int raw_input;		/* write-raw: frames are plain chunks of the file */
 /* Thread-nanoseconds, summed over the workers: decoding (including the page
  * faults on the image), in pwrite, and checking for zeros (the compressed
  * bytes against the zero frame, or a decoded frame for all zeros). */
@@ -249,6 +259,28 @@ static off_t read_seek_table(size_t size)
 	return dst;
 }
 
+/* write-raw: the file itself, as FRAME_SIZE chunks at their own offsets. */
+static off_t raw_frames(size_t size)
+{
+	size_t k;
+
+	if (size % ALIGN)
+		die(REFUSED, "%zu bytes, not a multiple of %d", size, ALIGN);
+	nframes = (size + FRAME_SIZE - 1) / FRAME_SIZE;
+	frames = calloc(nframes, sizeof(*frames));
+	if (!frames)
+		die(REFUSED, "out of memory");
+	for (k = 0; k < nframes; k++) {
+		size_t pos = k * FRAME_SIZE;
+		size_t len = size - pos < FRAME_SIZE ? size - pos : FRAME_SIZE;
+
+		frames[k] = (struct frame){ pos, len, pos, len };
+		if (len > max_dsize)
+			max_dsize = len;
+	}
+	return size;
+}
+
 /*
  * pack's encoding of a full-size frame of zeros, made here the same way. zstd
  * encodes the same input with the same settings to the same bytes, so a frame
@@ -338,15 +370,20 @@ static void *worker(void *arg)
 		k = order[k];
 		f = &frames[k];
 		t0 = now_ns();
-		if (is_zero_frame(f)) {
-			atomic_fetch_add(&zero_frames, 1);
-			skip += now_ns() - t0;
-			continue;
+		if (raw_input) {
+			memcpy(buf, image + f->src, f->dsize);
+			n = f->dsize;
+		} else {
+			if (is_zero_frame(f)) {
+				atomic_fetch_add(&zero_frames, 1);
+				skip += now_ns() - t0;
+				continue;
+			}
+			n = ZSTD_decompressDCtx(dctx, buf, f->dsize, image + f->src, f->csize);
 		}
-		n = ZSTD_decompressDCtx(dctx, buf, f->dsize, image + f->src, f->csize);
 		t1 = now_ns();
 		decode += t1 - t0;
-		if (ZSTD_isError(n) || n != f->dsize) {
+		if (!raw_input && (ZSTD_isError(n) || n != f->dsize)) {
 			fail("frame %zu: %s", k, ZSTD_isError(n) ?
 			     ZSTD_getErrorName(n) : "decoded to the wrong size");
 			break;
@@ -459,8 +496,12 @@ static int write_image(const char *path, const char *target, int threads)
 	t0 = now_ns();
 	image = map_file(path, &size, REFUSED);
 	cached = cache_snapshot(size);
-	total = read_seek_table(size);
-	encode_zero_frame();
+	if (raw_input) {
+		total = raw_frames(size);
+	} else {
+		total = read_seek_table(size);
+		encode_zero_frame();
+	}
 	plan_order(size, cached);
 
 	/*
@@ -514,7 +555,7 @@ int main(int argc, char **argv)
 
 	if (argc == 4 && !strcmp(argv[1], "pack"))
 		return pack(argv[2], argv[3]);
-	if ((argc == 4 || argc == 5) && !strcmp(argv[1], "write")) {
+	if ((argc == 4 || argc == 5) && (!strcmp(argv[1], "write") || !strcmp(argv[1], "write-raw"))) {
 		long cpus = sysconf(_SC_NPROCESSORS_ONLN);
 		int threads = cpus < 1 ? 1 : cpus > 16 ? 16 : cpus;
 
@@ -528,8 +569,10 @@ int main(int argc, char **argv)
 		}
 		if (threads < 1 || threads > MAX_THREADS)
 			die(REFUSED, "threads: 1 to %d", MAX_THREADS);
+		raw_input = !strcmp(argv[1], "write-raw");
 		return write_image(argv[2], argv[3], threads);
 	}
 	die(REFUSED, "usage: omarchy-image-write pack RAW IMAGE.zst\n"
-	    "       omarchy-image-write write IMAGE.zst TARGET [THREADS]");
+	    "       omarchy-image-write write IMAGE.zst TARGET [THREADS]\n"
+	    "       omarchy-image-write write-raw RAW TARGET [THREADS]");
 }

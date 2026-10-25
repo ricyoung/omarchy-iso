@@ -305,3 +305,50 @@ run write "$work/zero-altered.zst" "$work/target" 1
 [[ $status == 1 ]] || fail "a zero frame that is not byte-identical is decoded, not skipped" "status $status: $(cat "$work/stderr")"
 grep -q "frame 4:" "$work/stderr" || fail "names the altered zero frame" "$(cat "$work/stderr")"
 pass "a zero frame that is not byte-identical is decoded, not skipped"
+
+# --- write-raw -------------------------------------------------------------
+# The raw image as the installer finds it inside the mounted omarchy-root.sfs.
+
+for threads in 1 3 8; do
+  target "$work/target" 0
+  run write-raw "$raw" "$work/target" "$threads"
+  [[ $status == 0 ]] || fail "write-raw with $threads threads succeeds" "$(cat "$work/stderr")"
+  cmp -s "$work/target" "$raw" || fail "write-raw with $threads threads reproduces the raw image"
+  pass "write-raw with $threads threads reproduces the raw image"
+done
+
+grep -q "(11 frames, 2 zero, .* cached, 8 threads)" "$work/stderr" ||
+  fail "write-raw reports what it did" "$(cat "$work/stderr")"
+pass "write-raw reports what it did"
+
+# All-zero chunks are left unwritten: over a target of 170s, chunks 4 and 5
+# (the zeros) keep the 170s and everything else is the image.
+target "$work/target" 170
+run write-raw "$raw" "$work/target"
+[[ $status == 0 ]] || fail "write-raw over a non-zero target succeeds" "$(cat "$work/stderr")"
+python3 - "$work/target" "$raw" <<'PY' || fail "write-raw leaves all-zero chunks unwritten"
+import sys
+frame = 256 * 1024
+target, raw = open(sys.argv[1], "rb").read(), open(sys.argv[2], "rb").read()
+assert target[4 * frame:6 * frame] == bytes([170]) * 2 * frame
+assert target[:4 * frame] == raw[:4 * frame] and target[6 * frame:] == raw[6 * frame:]
+PY
+pass "write-raw leaves all-zero chunks unwritten"
+
+target "$work/target" 170
+run write-raw "$work/odd.img" "$work/target"
+untouched 2 "write-raw refuses an image that is not a multiple of 4096 bytes" "$work/target"
+
+run write-raw "$work/missing.img" "$work/target"
+untouched 2 "write-raw refuses a missing image" "$work/target"
+
+target "$work/small" 170 $((raw_size - 4096))
+run write-raw "$raw" "$work/small"
+untouched 1 "write-raw fails on a target smaller than the image, without writing" "$work/small"
+
+for args in "write-raw" "write-raw $raw" "write-raw $raw $work/target 0"; do
+  # shellcheck disable=SC2086
+  run $args
+  [[ $status == 2 ]] || fail "write-raw refuses bad arguments: '$args'" "status $status"
+done
+pass "write-raw refuses bad arguments"
